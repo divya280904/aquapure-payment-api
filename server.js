@@ -11,6 +11,7 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -115,6 +116,101 @@ app.post("/verify-payment", async (req, res) => {
       verified: false,
       error: "Could not verify payment",
     });
+  }
+});
+
+app.post("/razorpay-callback", async (req, res) => {
+  try {
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    } = req.body;
+
+    let result = {
+      type: "RAZORPAY_RESULT",
+      success: false,
+      message: "Payment could not be verified.",
+    };
+
+    if (
+      razorpay_order_id &&
+      razorpay_payment_id &&
+      razorpay_signature
+    ) {
+      const expectedSignature = crypto
+        .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+        .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+        .digest();
+
+      const receivedSignature = Buffer.from(
+        razorpay_signature,
+        "hex"
+      );
+
+      const signatureValid =
+        expectedSignature.length === receivedSignature.length &&
+        crypto.timingSafeEqual(
+          expectedSignature,
+          receivedSignature
+        );
+
+      if (signatureValid) {
+        const [payment, order] = await Promise.all([
+          razorpay.payments.fetch(razorpay_payment_id),
+          razorpay.orders.fetch(razorpay_order_id),
+        ]);
+
+        if (
+          payment.order_id === razorpay_order_id &&
+          payment.status === "captured" &&
+          payment.amount === order.amount &&
+          payment.currency === order.currency
+        ) {
+          result = {
+            type: "RAZORPAY_RESULT",
+            success: true,
+            paymentId: payment.id,
+            orderId: order.id,
+            amount: payment.amount,
+            currency: payment.currency,
+          };
+        }
+      }
+    }
+
+    // Send the verified result back to the React Native WebView.
+    const payload = JSON.stringify(JSON.stringify(result));
+
+    res.status(200).type("html").send(`
+      <!doctype html>
+      <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>AquaPure Payment</title>
+        </head>
+        <body style="font-family: sans-serif; text-align: center; padding: 32px;">
+          <h2>${result.success ? "Payment verified" : "Payment not verified"}</h2>
+          <p>${result.success
+            ? "Return to AquaPure to finish your order."
+            : "Return to AquaPure and try again if needed."}</p>
+          <script>
+            (function () {
+              var message = ${payload};
+              if (window.ReactNativeWebView) {
+                window.ReactNativeWebView.postMessage(message);
+              }
+            })();
+          </script>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error("Razorpay callback failed:", error.message);
+
+    res.status(500).send(
+      "Payment verification failed. Return to AquaPure and check your order status."
+    );
   }
 });
 
