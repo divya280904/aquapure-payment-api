@@ -357,6 +357,141 @@ app.post("/razorpay-callback", async (req, res) => {
   `);
 });
 
+
+app.post("/admin/order-status", authenticate, async (req, res) => {
+  try {
+    // Only administrators may change order status.
+    if (req.user.admin !== true) {
+      return res.status(403).json({
+        error: "Admin permission is required",
+      });
+    }
+
+    const { orderId, status } = req.body;
+
+    if (
+      typeof orderId !== "string" ||
+      !orderId.trim() ||
+      typeof status !== "string" ||
+      !status.trim() ||
+      status.length > 40
+    ) {
+      return res.status(400).json({
+        error: "Valid order ID and status are required",
+      });
+    }
+
+    const orderRef = db.collection("orders").doc(orderId.trim());
+    const orderSnapshot = await orderRef.get();
+
+    if (!orderSnapshot.exists) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const order = orderSnapshot.data();
+    const previousStatus = order.status;
+
+    if (previousStatus === status.trim()) {
+      return res.json({
+        success: true,
+        notificationSent: false,
+        message: "Order already has this status",
+      });
+    }
+
+    // Update the order on the trusted server.
+    await orderRef.update({
+      status: status.trim(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    // Find the customer and their saved Expo push token.
+    const userId = order.userId;
+
+    if (!userId) {
+      return res.json({
+        success: true,
+        notificationSent: false,
+        message: "Order updated; customer ID is missing",
+      });
+    }
+
+    const userSnapshot = await db
+      .collection("users")
+      .doc(userId)
+      .get();
+
+    const userData = userSnapshot.exists
+      ? userSnapshot.data()
+      : {};
+
+    const pushToken = userData.expoPushToken;
+
+    if (
+      typeof pushToken !== "string" ||
+      !/^Expo(nent)?PushToken\[.+\]$/.test(pushToken)
+    ) {
+      return res.json({
+        success: true,
+        notificationSent: false,
+        message: "Order updated; customer has no valid Expo push token",
+      });
+    }
+
+    // Send the notification through Expo's push service.
+    const expoResponse = await fetch(
+      "https://exp.host/--/api/v2/push/send",
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          to: pushToken,
+          title: "AquaPure Order Update",
+          body: `Your order status is now ${status.trim()}.`,
+          channelId: "default",
+          sound: "default",
+          data: {
+            type: "order_status_update",
+            orderId: orderRef.id,
+            status: status.trim(),
+          },
+        }),
+      }
+    );
+
+    const expoResult = await expoResponse.json();
+    const ticket = expoResult?.data;
+
+    const notificationSent =
+      expoResponse.ok &&
+      ticket?.status === "ok";
+
+    if (!notificationSent) {
+      console.error(
+        "Expo notification failed:",
+        JSON.stringify(ticket?.details || ticket?.message || ticket)
+      );
+    }
+
+    return res.json({
+      success: true,
+      notificationSent,
+      message: notificationSent
+        ? "Order updated and notification accepted by Expo"
+        : "Order updated, but Expo did not accept the notification",
+    });
+  } catch (error) {
+    console.error("Order status update failed:", error.message);
+    return res.status(500).json({
+      error: "Could not update order status",
+    });
+  }
+});
+
+
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, "0.0.0.0", () => {
