@@ -8,6 +8,14 @@ const path = require("path");
 const { initializeApp, cert, getApps } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+const {
+  sendEmail,
+  sendSMS,
+  getOrderPlacedEmailTemplate,
+  getOrderStatusUpdateEmailTemplate,
+  getServiceBookingEmailTemplate,
+  getServiceStatusUpdateEmailTemplate,
+} = require("./notifications");
 
 dotenv.config();
 
@@ -61,6 +69,139 @@ async function authenticate(req, res, next) {
     next();
   } catch {
     return res.status(401).json({ error: "Invalid or expired login" });
+  }
+}
+
+// Helper to deliver push notification via Expo
+async function sendExpoPush(token, title, body, data = {}) {
+  if (
+    typeof token !== "string" ||
+    !/^Expo(nent)?PushToken\[.+\]$/.test(token)
+  ) {
+    return false;
+  }
+  try {
+    const expoResponse = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        to: token,
+        title,
+        body,
+        channelId: "default",
+        sound: "default",
+        data,
+      }),
+    });
+    const result = await expoResponse.json();
+    return expoResponse.ok && result?.data?.status === "ok";
+  } catch (err) {
+    console.error("Expo push notification failed:", err.message);
+    return false;
+  }
+}
+
+// Helper to notify customer on order placement (Push, Email, SMS)
+async function notifyOrderPlaced(orderId, orderData) {
+  try {
+    const { userId, customerName, email, phone, items, total, address, paymentMethod } = orderData;
+    let pushToken = "";
+
+    if (userId) {
+      const userDoc = await db.collection("users").doc(userId).get();
+      if (userDoc.exists) {
+        pushToken = userDoc.data()?.expoPushToken || "";
+      }
+    }
+
+    // 1. Email notification
+    if (email) {
+      sendEmail({
+        to: email,
+        subject: `AquaPure Order Confirmed #${orderId.slice(-8)}`,
+        html: getOrderPlacedEmailTemplate({
+          orderId,
+          customerName,
+          items,
+          total,
+          address,
+          paymentMethod,
+        }),
+      }).catch((e) => console.error("Order placed email error:", e.message));
+    }
+
+    // 2. SMS notification
+    if (phone) {
+      sendSMS({
+        phone,
+        message: `AquaPure: Your order #${orderId.slice(-8)} (₹${total}) has been placed successfully! Payment: ${paymentMethod || "COD"}. Track in AquaPure app.`,
+      }).catch((e) => console.error("Order placed SMS error:", e.message));
+    }
+
+    // 3. Expo Push notification
+    if (pushToken) {
+      sendExpoPush(
+        pushToken,
+        "Order Confirmed!",
+        `Your order #${orderId.slice(-8)} has been placed successfully.`,
+        { type: "order_placed", orderId }
+      ).catch((e) => console.error("Order placed push error:", e.message));
+    }
+  } catch (err) {
+    console.error("notifyOrderPlaced failed:", err.message);
+  }
+}
+
+// Helper to notify customer on service booking (Push, Email, SMS)
+async function notifyServiceBooked(requestId, serviceData) {
+  try {
+    const { userId, customerName, email, phone, serviceType, preferredDate, address } = serviceData;
+    let pushToken = "";
+
+    if (userId) {
+      const userDoc = await db.collection("users").doc(userId).get();
+      if (userDoc.exists) {
+        pushToken = userDoc.data()?.expoPushToken || "";
+      }
+    }
+
+    // 1. Email notification
+    if (email) {
+      sendEmail({
+        to: email,
+        subject: `AquaPure Service Booked #${requestId.slice(-8)} (${serviceType})`,
+        html: getServiceBookingEmailTemplate({
+          requestId,
+          customerName,
+          serviceType,
+          preferredDate,
+          address,
+        }),
+      }).catch((e) => console.error("Service booking email error:", e.message));
+    }
+
+    // 2. SMS notification
+    if (phone) {
+      sendSMS({
+        phone,
+        message: `AquaPure: Your request for ${serviceType} (#${requestId.slice(-8)}) has been confirmed. Our technician will contact you shortly.`,
+      }).catch((e) => console.error("Service booking SMS error:", e.message));
+    }
+
+    // 3. Expo Push notification
+    if (pushToken) {
+      sendExpoPush(
+        pushToken,
+        "Service Request Received",
+        `Your ${serviceType} request #${requestId.slice(-8)} has been confirmed.`,
+        { type: "service_booked", requestId }
+      ).catch((e) => console.error("Service booking push error:", e.message));
+    }
+  } catch (err) {
+    console.error("notifyServiceBooked failed:", err.message);
   }
 }
 
@@ -322,6 +463,15 @@ app.post("/razorpay-callback", async (req, res) => {
       paymentId,
       message: "Payment verified and order recorded.",
     };
+
+    // Trigger multi-channel confirmation asynchronously
+    orderRef.get().then((snap) => {
+      if (snap.exists) {
+        notifyOrderPlaced(orderRef.id, snap.data()).catch((e) =>
+          console.error("Razorpay order notification dispatch failed:", e.message)
+        );
+      }
+    }).catch((e) => console.error("Error reading verified order:", e.message));
   } catch (error) {
     console.error("Payment callback failed:", error.message);
   }
@@ -405,89 +555,235 @@ app.post("/admin/order-status", authenticate, async (req, res) => {
       updatedAt: FieldValue.serverTimestamp(),
     });
 
-    // Find the customer and their saved Expo push token.
+    // Retrieve customer information for multi-channel notification.
     const userId = order.userId;
+    let pushToken = "";
+    let customerEmail = order.email;
+    let customerPhone = order.phone;
+    let customerName = order.customerName;
 
-    if (!userId) {
-      return res.json({
-        success: true,
-        notificationSent: false,
-        message: "Order updated; customer ID is missing",
-      });
+    if (userId) {
+      const userSnapshot = await db.collection("users").doc(userId).get();
+      if (userSnapshot.exists) {
+        const userData = userSnapshot.data();
+        pushToken = userData.expoPushToken || "";
+        customerEmail = customerEmail || userData.email;
+        customerPhone = customerPhone || userData.phone;
+        customerName = customerName || userData.name;
+      }
     }
 
-    const userSnapshot = await db
-      .collection("users")
-      .doc(userId)
-      .get();
-
-    const userData = userSnapshot.exists
-      ? userSnapshot.data()
-      : {};
-
-    const pushToken = userData.expoPushToken;
-
-    if (
-      typeof pushToken !== "string" ||
-      !/^Expo(nent)?PushToken\[.+\]$/.test(pushToken)
-    ) {
-      return res.json({
-        success: true,
-        notificationSent: false,
-        message: "Order updated; customer has no valid Expo push token",
-      });
-    }
-
-    // Send the notification through Expo's push service.
-    const expoResponse = await fetch(
-      "https://exp.host/--/api/v2/push/send",
+    // 1. Expo Push notification
+    const notificationSent = await sendExpoPush(
+      pushToken,
+      "AquaPure Order Update",
+      `Your order status is now ${status.trim()}.`,
       {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          to: pushToken,
-          title: "AquaPure Order Update",
-          body: `Your order status is now ${status.trim()}.`,
-          channelId: "default",
-          sound: "default",
-          data: {
-            type: "order_status_update",
-            orderId: orderRef.id,
-            status: status.trim(),
-          },
-        }),
+        type: "order_status_update",
+        orderId: orderRef.id,
+        status: status.trim(),
       }
     );
 
-    const expoResult = await expoResponse.json();
-    const ticket = expoResult?.data;
+    // 2. Email notification
+    if (customerEmail) {
+      sendEmail({
+        to: customerEmail,
+        subject: `AquaPure Order Update: #${orderRef.id.slice(-8)} is now ${status.trim()}`,
+        html: getOrderStatusUpdateEmailTemplate({
+          orderId: orderRef.id,
+          customerName,
+          newStatus: status.trim(),
+        }),
+      }).catch((e) => console.error("Order status update email error:", e.message));
+    }
 
-    const notificationSent =
-      expoResponse.ok &&
-      ticket?.status === "ok";
-
-    if (!notificationSent) {
-      console.error(
-        "Expo notification failed:",
-        JSON.stringify(ticket?.details || ticket?.message || ticket)
-      );
+    // 3. SMS notification
+    if (customerPhone) {
+      sendSMS({
+        phone: customerPhone,
+        message: `AquaPure: Your order #${orderRef.id.slice(-8)} status is now "${status.trim()}". Check My Orders in app for details.`,
+      }).catch((e) => console.error("Order status update SMS error:", e.message));
     }
 
     return res.json({
       success: true,
       notificationSent,
       message: notificationSent
-        ? "Order updated and notification accepted by Expo"
-        : "Order updated, but Expo did not accept the notification",
+        ? "Order updated and notification sent"
+        : "Order updated successfully",
     });
   } catch (error) {
     console.error("Order status update failed:", error.message);
     return res.status(500).json({
       error: "Could not update order status",
     });
+  }
+});
+
+// Update Service Request status (Admin only) with multi-channel notification
+app.post("/admin/service-status", authenticate, async (req, res) => {
+  try {
+    if (req.user.admin !== true) {
+      return res.status(403).json({ error: "Admin permission is required" });
+    }
+
+    const { requestId, status } = req.body;
+    if (
+      typeof requestId !== "string" ||
+      !requestId.trim() ||
+      typeof status !== "string" ||
+      !status.trim() ||
+      status.length > 40
+    ) {
+      return res.status(400).json({
+        error: "Valid request ID and status are required",
+      });
+    }
+
+    const serviceRef = db.collection("serviceRequests").doc(requestId.trim());
+    const serviceSnapshot = await serviceRef.get();
+
+    if (!serviceSnapshot.exists) {
+      return res.status(404).json({ error: "Service request not found" });
+    }
+
+    const service = serviceSnapshot.data();
+    const previousStatus = service.status;
+
+    if (previousStatus === status.trim()) {
+      return res.json({
+        success: true,
+        notificationSent: false,
+        message: "Service request already has this status",
+      });
+    }
+
+    // Update status server-side
+    await serviceRef.update({
+      status: status.trim(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    const userId = service.userId;
+    let pushToken = "";
+    let customerEmail = service.email;
+    let customerPhone = service.phone;
+    let customerName = service.customerName;
+
+    if (userId) {
+      const userSnapshot = await db.collection("users").doc(userId).get();
+      if (userSnapshot.exists) {
+        const userData = userSnapshot.data();
+        pushToken = userData.expoPushToken || "";
+        customerEmail = customerEmail || userData.email;
+        customerPhone = customerPhone || userData.phone;
+        customerName = customerName || userData.name;
+      }
+    }
+
+    // 1. Expo Push notification
+    const notificationSent = await sendExpoPush(
+      pushToken,
+      "AquaPure Service Update",
+      `Your ${service.serviceType || "service"} status is now ${status.trim()}.`,
+      {
+        type: "service_status_update",
+        requestId: serviceRef.id,
+        status: status.trim(),
+      }
+    );
+
+    // 2. Email notification
+    if (customerEmail) {
+      sendEmail({
+        to: customerEmail,
+        subject: `AquaPure Service Update: #${serviceRef.id.slice(-8)} is now ${status.trim()}`,
+        html: getServiceStatusUpdateEmailTemplate({
+          requestId: serviceRef.id,
+          customerName,
+          serviceType: service.serviceType || "Service",
+          newStatus: status.trim(),
+        }),
+      }).catch((e) => console.error("Service status email error:", e.message));
+    }
+
+    // 3. SMS notification
+    if (customerPhone) {
+      sendSMS({
+        phone: customerPhone,
+        message: `AquaPure: Your service request for ${service.serviceType || "Service"} is now "${status.trim()}".`,
+      }).catch((e) => console.error("Service status SMS error:", e.message));
+    }
+
+    return res.json({
+      success: true,
+      notificationSent,
+      message: "Service request status updated successfully",
+    });
+  } catch (error) {
+    console.error("Service status update failed:", error.message);
+    return res.status(500).json({ error: "Could not update service status" });
+  }
+});
+
+// Notify on COD order placed
+app.post("/notify/order-confirmation", authenticate, async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    if (!orderId || typeof orderId !== "string") {
+      return res.status(400).json({ error: "orderId is required" });
+    }
+
+    const orderDoc = await db.collection("orders").doc(orderId.trim()).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const orderData = orderDoc.data();
+    if (orderData.userId !== req.user.uid && req.user.admin !== true) {
+      return res.status(403).json({ error: "Unauthorized access to order" });
+    }
+
+    await notifyOrderPlaced(orderDoc.id, orderData);
+
+    return res.json({
+      success: true,
+      message: "Order confirmation notifications dispatched",
+    });
+  } catch (err) {
+    console.error("notify/order-confirmation error:", err.message);
+    return res.status(500).json({ error: "Failed to dispatch notifications" });
+  }
+});
+
+// Notify on service booking created
+app.post("/notify/service-booking", authenticate, async (req, res) => {
+  try {
+    const { requestId } = req.body;
+    if (!requestId || typeof requestId !== "string") {
+      return res.status(400).json({ error: "requestId is required" });
+    }
+
+    const requestDoc = await db.collection("serviceRequests").doc(requestId.trim()).get();
+    if (!requestDoc.exists) {
+      return res.status(404).json({ error: "Service request not found" });
+    }
+
+    const serviceData = requestDoc.data();
+    if (serviceData.userId !== req.user.uid && req.user.admin !== true) {
+      return res.status(403).json({ error: "Unauthorized access to request" });
+    }
+
+    await notifyServiceBooked(requestDoc.id, serviceData);
+
+    return res.json({
+      success: true,
+      message: "Service booking notifications dispatched",
+    });
+  } catch (err) {
+    console.error("notify/service-booking error:", err.message);
+    return res.status(500).json({ error: "Failed to dispatch notifications" });
   }
 });
 
